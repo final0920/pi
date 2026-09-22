@@ -1,0 +1,238 @@
+name: Build Pi (Purge)
+
+# Builds standalone pi binaries from this fork, with the built-in purge extension
+# compiled into the executable. Verification runs first so a broken build never
+# produces a downloadable artifact.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Platform list (space separated)'
+        required: false
+        default: 'linux-x64 linux-arm64 darwin-x64 darwin-arm64 windows-x64 windows-arm64'
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: build-pi-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Keep the compiled-in prompt in sync with prompt.md across every job.
+  PI_OFFLINE: '1'
+
+jobs:
+  verify:
+    name: Verify sources and extension
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Verify generated purge prompt is current
+        run: npm run check:purge-prompt
+
+      - name: Run purge extension tests
+        working-directory: packages/coding-agent
+        run: node ../../node_modules/vitest/dist/cli.js --run test/suite/builtin-purge.test.ts
+
+      - name: Lint changed extension sources
+        run: ./node_modules/.bin/biome check --error-on-warnings packages/coding-agent/src/extensions scripts/embed-purge-prompt.mjs
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - linux-x64
+          - linux-arm64
+          - darwin-x64
+          - darwin-arm64
+          - windows-x64
+          - windows-arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
+          sudo ln -s "$(which fdfind)" /usr/local/bin/fd
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      # Release model data is generated, not committed. Building offline keeps the
+      # run hermetic; the cross-platform bun targets need no per-OS runner.
+      - name: Hydrate model data
+        run: npm run hydrate:model-data
+
+      - name: Build packages
+        run: npm run build:offline
+
+      - name: Build binary
+        run: |
+          set -euo pipefail
+          cd packages/coding-agent
+          platform="${{ matrix.platform }}"
+          bun_target="bun-${platform}"
+          if [[ "$platform" == *-x64 ]]; then
+            bun_target="${bun_target}-baseline"
+          fi
+          mkdir -p "binaries/${platform}"
+          if [[ "$platform" == windows-* ]]; then
+            bun build --compile --no-compile-autoload-bunfig --target="$bun_target" \
+              ./dist/bun/cli.js ./src/utils/image-resize-worker.ts \
+              --outfile "binaries/${platform}/pi.exe"
+          else
+            bun build --compile --no-compile-autoload-bunfig --target="$bun_target" \
+              ./dist/bun/cli.js ./src/utils/image-resize-worker.ts \
+              --outfile "binaries/${platform}/pi"
+          fi
+
+      - name: Assemble runtime assets
+        run: |
+          set -euo pipefail
+          cd packages/coding-agent
+          platform="${{ matrix.platform }}"
+          out="binaries/${platform}"
+
+          cp package.json README.md CHANGELOG.md "$out/"
+          cp ../../node_modules/@silvia-odwyer/photon-node/photon_rs_bg.wasm "$out/"
+
+          mkdir -p "$out/theme" "$out/assets"
+          cp dist/modes/interactive/theme/*.json "$out/theme/"
+          cp dist/modes/interactive/assets/* "$out/assets/"
+          cp -r dist/core/export-html "$out/"
+          cp -r docs "$out/"
+          cp -r examples "$out/"
+
+          native_platform="${platform/windows-/win32-}"
+          native_path="native/${native_platform%-*}/prebuilds"
+          mkdir -p "$out/$native_path"
+          cp -R "../tui/$native_path/$native_platform" "$out/$native_path/"
+
+      - name: Package artifact
+        run: |
+          set -euo pipefail
+          cd packages/coding-agent/binaries
+          platform="${{ matrix.platform }}"
+          if [[ "$platform" == windows-* ]]; then
+            (cd "$platform" && zip -qr "../pi-${platform}.zip" .)
+            rm -rf "$platform"
+            echo "artifact=pi-${platform}.zip" >> "$GITHUB_ENV"
+          else
+            mv "$platform" pi
+            tar -czf "pi-${platform}.tar.gz" pi
+            rm -rf pi
+            echo "artifact=pi-${platform}.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65e6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pi-${{ matrix.platform }}
+          path: packages/coding-agent/binaries/${{ env.artifact }}
+          if-no-files-found: error
+          retention-days: 14
+
+  smoke-test:
+    name: Smoke test ${{ matrix.runner }}
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Extract current-platform binary
+        id: binary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          runtime_platform="$(node -p '`${process.platform}-${process.arch}`')"
+          case "${runtime_platform}" in
+            darwin-arm64|darwin-x64|linux-arm64|linux-x64)
+              archive="artifacts/pi-${runtime_platform}.tar.gz"
+              mkdir -p extracted
+              tar -xf "${archive}" -C extracted
+              binary="extracted/pi/pi"
+              ;;
+            win32-x64)
+              mkdir -p extracted
+              ARCHIVE_PATH="$(cygpath -w artifacts/pi-windows-x64.zip)"
+              DESTINATION_PATH="$(cygpath -w extracted)"
+              export ARCHIVE_PATH DESTINATION_PATH
+              powershell.exe -NoProfile -NonInteractive -Command \
+                'Expand-Archive -LiteralPath $env:ARCHIVE_PATH -DestinationPath $env:DESTINATION_PATH -Force'
+              binary="extracted/pi.exe"
+              ;;
+            *)
+              echo "::error::Unsupported runner platform ${runtime_platform}"
+              exit 1
+              ;;
+          esac
+
+          test -f "${binary}"
+          echo "binary=${binary}" >> "${GITHUB_OUTPUT}"
+
+      - name: Confirm the purge prompt is compiled in
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="${{ steps.binary.outputs.binary }}"
+          "$binary" --help | tee help.txt
+          # The flag only exists because the purge extension is registered.
+          grep -q -- "--no-purge-prompt" help.txt
+          "$binary" --version
