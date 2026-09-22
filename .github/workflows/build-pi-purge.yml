@@ -24,10 +24,6 @@ concurrency:
   group: build-pi-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  # Keep the compiled-in prompt in sync with prompt.md across every job.
-  PI_OFFLINE: '1'
-
 jobs:
   verify:
     name: Verify sources and extension
@@ -49,11 +45,18 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
+      # Provider model data is generated, not committed. Generating it here keeps the
+      # test step independent of the build job and matches the official CI ordering.
+      - name: Generate model data
+        run: npm run hydrate:model-data
+
       - name: Verify generated purge prompt is current
         run: npm run check:purge-prompt
 
       - name: Run purge extension tests
         working-directory: packages/coding-agent
+        env:
+          PI_OFFLINE: '1'
         run: node ../../node_modules/vitest/dist/cli.js --run test/suite/builtin-purge.test.ts
 
       - name: Lint changed extension sources
@@ -229,6 +232,8 @@ jobs:
 
       - name: Confirm the purge prompt is compiled in
         shell: bash
+        env:
+          PI_OFFLINE: '1'
         run: |
           set -euo pipefail
           binary="${{ steps.binary.outputs.binary }}"
